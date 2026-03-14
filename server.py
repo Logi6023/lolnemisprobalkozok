@@ -2,112 +2,109 @@ import asyncio
 import json
 import os
 import websockets
+from websockets.exceptions import ConnectionClosedError
 
-DATA_FILE = "data.json"
-PORT = int(os.environ.get("PORT", 8000))
+PORT = int(os.getenv("PORT", 8080))
 
-connected_users = {}  # websocket -> username
-
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {"users": {}, "messages": []}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+# connected_clients: { websocket: {"username": "bajtay"} }
+connected_clients = {}
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+async def send_user_list():
+    users = [data["username"] for data in connected_clients.values()]
+    msg = json.dumps({
+        "type": "user_list",
+        "users": users
+    })
+    await asyncio.gather(*[
+        ws.send(msg)
+        for ws in connected_clients.keys()
+    ], return_exceptions=True)
 
 
-async def register_user(ws, data_store, payload):
-    username = payload.get("username")
-    password = payload.get("password")
-    if not username or not password:
-        await ws.send(json.dumps({"type": "error", "message": "Hiányzó username vagy password"}))
-        return
+async def broadcast_message(sender_ws, text):
+    sender_name = connected_clients.get(sender_ws, {}).get("username", "ismeretlen")
 
-    if username in data_store["users"]:
-        await ws.send(json.dumps({"type": "error", "message": "Felhasználó már létezik"}))
-        return
+    msg = json.dumps({
+        "type": "message",
+        "from": sender_name,
+        "text": text
+    })
 
-    data_store["users"][username] = {"password": password}
-    save_data(data_store)
-    await ws.send(json.dumps({"type": "info", "message": "Sikeres regisztráció"}))
-
-
-async def login_user(ws, data_store, payload):
-    username = payload.get("username")
-    password = payload.get("password")
-    if not username or not password:
-        await ws.send(json.dumps({"type": "error", "message": "Hiányzó username vagy password"}))
-        return
-
-    user = data_store["users"].get(username)
-    if not user or user["password"] != password:
-        await ws.send(json.dumps({"type": "error", "message": "Hibás belépési adatok"}))
-        return
-
-    connected_users[ws] = username
-    await ws.send(json.dumps({"type": "info", "message": f"Bejelentkezve: {username}"}))
+    await asyncio.gather(*[
+        ws.send(msg)
+        for ws in connected_clients.keys()
+    ], return_exceptions=True)
 
 
-async def broadcast_message(sender_ws, data_store, payload):
-    if sender_ws not in connected_users:
-        await sender_ws.send(json.dumps({"type": "error", "message": "Nem vagy bejelentkezve"}))
-        return
+async def handler(ws):
+    print("[inf] Új kapcsolat érkezett")
 
-    username = connected_users[sender_ws]
-    text = payload.get("text")
-    if not text:
-        await sender_ws.send(json.dumps({"type": "error", "message": "Üres üzenet"}))
-        return
-
-    msg = {"from": username, "text": text}
-    data_store["messages"].append(msg)
-    save_data(data_store)
-
-    message_packet = json.dumps({"type": "message", "from": username, "text": text})
-    for ws in list(connected_users.keys()):
-        try:
-            await ws.send(message_packet)
-        except:
-            pass
-
-
-async def handler(ws, path):
-    data_store = load_data()
     try:
         async for raw in ws:
             try:
-                msg = json.loads(raw)
+                data = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send(json.dumps({"type": "error", "message": "Érvénytelen JSON"}))
+                print("[err] Rossz JSON:", raw)
                 continue
 
-            action = msg.get("action")
-            payload = msg.get("data", {})
+            action = data.get("action")
+            payload = data.get("data", {})
 
-            if action == "register":
-                await register_user(ws, data_store, payload)
-            elif action == "login":
-                await login_user(ws, data_store, payload)
+            # LOGIN
+            if action == "login":
+                username = payload.get("username")
+                password = payload.get("password")
+
+                # Itt lehetne valódi auth, most bárkit beengedünk
+                if not username or not password:
+                    await ws.send(json.dumps({
+                        "type": "error",
+                        "message": "Hiányzó felhasználónév vagy jelszó."
+                    }))
+                    continue
+
+                connected_clients[ws] = {"username": username}
+                print(f"[inf] Bejelentkezett: {username}")
+
+                await ws.send(json.dumps({
+                    "type": "login_ok",
+                    "username": username
+                }))
+
+                await send_user_list()
+
+            # SEND MESSAGE
             elif action == "send":
-                await broadcast_message(ws, data_store, payload)
-            elif action == "history":
-                await ws.send(json.dumps({"type": "history", "messages": data_store["messages"]}))
+                text = payload.get("text", "").strip()
+                if not text:
+                    continue
+
+                await broadcast_message(ws, text)
+
             else:
-                await ws.send(json.dumps({"type": "error", "message": "Ismeretlen action"}))
+                print("[err] Ismeretlen action:", action)
+
+    except ConnectionClosedError:
+        # Normális, ha a kliens bezárja az ablakot / kilép
+        print("[inf] A kliens bontotta a kapcsolatot (ConnectionClosedError).")
+
+    except Exception as e:
+        print("[err] Váratlan hiba a handlerben:", repr(e))
+
     finally:
-        if ws in connected_users:
-            del connected_users[ws]
+        # Takarítás: ha volt login, töröljük a klienst
+        if ws in connected_clients:
+            user = connected_clients[ws]["username"]
+            print(f"[inf] Kijelentkezett: {user}")
+            del connected_clients[ws]
+            await send_user_list()
 
 
 async def main():
+    print(f"[inf]  Szerver fut a porton: {PORT}")
     async with websockets.serve(handler, "0.0.0.0", PORT):
-        print(f"Szerver fut a porton: {PORT}")
-        await asyncio.Future()
+        await asyncio.Future()  # fut amíg meg nem állítják
 
 
 if __name__ == "__main__":
